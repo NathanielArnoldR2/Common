@@ -579,8 +579,10 @@ function Set-SavedData ($data) {
   New-Item -Path $script:dataPath -ItemType File -Value $json -Force | Out-Null
 }
 
+
+# The ConvertFrom-Json cmdlet is unavailable in PowerShell -lt v3.
 $scriptParameters = $null
-if (Test-Path -LiteralPath $PSScriptRoot\ScriptParameters.json) {
+if ((Test-Path -LiteralPath $PSScriptRoot\ScriptParameters.json) -and $PSVersionTable.PSVersion -gt "2.0") {
   $scriptParameters = Get-Content -LiteralPath $PSScriptRoot\ScriptParameters.json -Raw |
                         ConvertFrom-Json
 }
@@ -837,7 +839,7 @@ function Write-ErrorLog {
     Add-Content -LiteralPath $script:errorLogPath -Value ([System.Environment]::NewLine + ("-" * 80) + [System.Environment]::NewLine)
   }
 
-  $global:Error | Out-File -LiteralPath $script:errorLogPath -Append -Width ([int]::MaxValue)
+  $global:Error | Out-File -FilePath $script:errorLogPath -Append -Width ([int]::MaxValue)
 
   # Ensures that host-visible evidence of any error is written at the earliest
   # opportunity. Since an erroneous configuration is not one that is meant to
