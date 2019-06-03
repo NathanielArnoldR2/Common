@@ -493,46 +493,6 @@ function Test-CTBackInfo ([switch]$Quiet) {
     return [PSCustomObject]$outHash
   }
 }
-
-function Wait-CTBackInfo ($ProfileName) {
-  $tempPath = "C:\Users\$ProfileName\AppData\Local\Temp"
-
-  $logPath = "C:\Users\$ProfileName\AppData\Local\Temp\CTBackInfo.log"
-
-  $startTime = Get-Date
-
-  $lastBootTime = Get-WmiObject Win32_OperatingSystem |
-                    ForEach-Object {$_.ConvertToDateTime($_.LastBootUpTime)}
-
-  $logDetected = $false
-
-  do {
-    Start-Sleep -Seconds 60
-
-    $logPaths = (@(
-      $tempPath
-    ) + @(
-      Get-ChildItem -LiteralPath $tempPath |
-        Where-Object {$_ -is [System.IO.DirectoryInfo]} |
-        Where-Object {$_.Name -match "^[1-9]\d*$"} |
-        ForEach-Object FullName
-    )) |
-      ForEach-Object {
-        Join-Path -Path $_ -ChildPath CTBackInfo.log
-      }
-
-    $logDetected = @(
-      $logPaths |
-        Where-Object {
-          (Test-Path -LiteralPath $_) -and (Get-Item -LiteralPath $_).LastWriteTime -gt $lastBootTime
-        }
-    ).Count -gt 0
-  } while ((-not $logDetected) -and (((Get-Date) - $startTime).TotalMinutes -lt 5))
-
-  if (-not ($logDetected)) {
-    Write-Error "Updated CTBackInfo log path for profile `"$ProfileName`" not detected within 5 minutes."
-  }
-}
 #endregion
 
 #region Saved Data
@@ -878,6 +838,19 @@ function Invoke-FinAckHandshake ([Switch]$RemoveHostValues) {
     Start-Sleep -Seconds 10
     Remove-ItemProperty -LiteralPath $hostValues -Name ack
   }
+}
+
+function Write-FinFile {
+  [PSCustomObject]@{
+    "FIN Message" = @"
+When this file is written to the public desktop, configuration has ended. If the error log file was not also written, the configuration is assumed to be successful.
+
+Students, if you see this file it is safe to delete it -- although I really should have done so myself.
+"@
+    "FIN Time" = [datetime]::Now.ToString("O")
+  } |
+    Format-List |
+    Out-File -FilePath (Join-Path -Path ([System.Environment]::GetFolderPath("CommonDesktop")) -ChildPath FIN.txt)
 }
 
 function Wait-HostPoke ([Switch]$RemoveHostValues) {
