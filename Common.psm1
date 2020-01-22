@@ -177,91 +177,170 @@ function Set-IPConfiguration {
 }
 
 function Wait-Domain {
-  while ($true) {
-    $hadError = $false
+  [CmdletBinding()]
+  param(
+    [timespan]
+    $Timeout = [timespan]::FromMinutes(10)
+  )
 
-    try {
-      Import-Module ActiveDirectory -ErrorAction Stop
+  try {
+    $span = Measure-Command {
+      $start = [datetime]::Now
+
+      while ($true) {
+        if (([datetime]::Now - $start) -gt $Timeout.Duration()) {
+          throw "Module import w/ 'AD' PSDrive in out-of-process PSJob did not occur within configured timeout."
+        }
+
+        $job = Start-Job -ScriptBlock {
+          Import-Module ActiveDirectory -ErrorAction Stop
+
+          Get-PSDrive -Name AD -ErrorAction Stop
+        }
+      
+        $job |
+          Wait-Job |
+          Out-Null
+      
+        $jobState = $job.ChildJobs[0].JobStateInfo
+      
+        $job |
+          Remove-Job
+      
+        if (
+          $jobState.State -eq [System.Management.Automation.JobState]::Failed -and
+          $jobState.Reason.Message -eq "Attempting to perform the InitializeDefaultDrives operation on the 'ActiveDirectory' provider failed."
+        ) {
+          continue
+        } elseif (
+          $jobState.State -eq [System.Management.Automation.JobState]::Failed -and
+          $jobState.Reason.Message -eq "Cannot find drive. A drive with the name 'AD' does not exist."
+        ) {
+          continue
+        } elseif ($jobState.State -ne [System.Management.Automation.JobState]::Completed) {
+          throw $jobState.Reason
+        } else {
+          break
+        }
+      }
     }
-    catch {
-      $global:Error.RemoveAt(0)
 
-      Start-Sleep -Seconds 10
-      $hadError = $true
-    }
+    Write-Verbose "Spent $span waiting for successful module import w/ PSDrive in out-of-process PSJob."
 
-    if (-not $hadError) {
-      break
-    }
-  }
+    Import-Module ActiveDirectory -Verbose:$false -ErrorAction Stop
 
-  while ($true) {
-    $hadError = $false
+    Get-PSDrive -Name AD -ErrorAction Stop |
+      Out-Null
 
-    try {
-      Get-ADUser -Filter 'Name -eq "Administrator"' -ErrorAction Stop | Out-Null
-    }
-    catch {
-      $global:Error.RemoveAt(0)
+    Write-Verbose "Confirmed successful module import w/ PSDrive in-process."
 
-      Start-Sleep -Seconds 10
-      $hadError = $true
-    }
-
-    if (-not $hadError) {
-      break
-    }
+  } catch {
+    $PSCmdlet.ThrowTerminatingError($_)
   }
 }
 
-function Join-Domain ([string]$Domain, [string]$User, [string]$Password) {
-  $ping = New-Object System.Net.NetworkInformation.Ping
+function Join-Domain {
+  [CmdletBinding(
+    PositionalBinding = $false
+  )]
+  param(
+    [Parameter(
+      Mandatory = $true
+    )]
+    [string]
+    $DomainName,
 
-  while ($true) {
-    try {
-      $result = $ping.Send($Domain)
-    }
-    catch {
+    [Parameter(
+      Mandatory = $true
+    )]
+    [string]
+    $UserName,
 
-      # Catching an exception does not prevent the corresponding error from
-      # being logged, although it does keep it from appearing in a visible
-      # console window. Therefore, this method is required to prevent log
-      # file output.
-      $global:Error.RemoveAt(0)
+    [Parameter(
+      Mandatory = $true
+    )]
+    [string]
+    $Password,
 
-      Start-Sleep -Seconds 5
-    }
+    [string]
+    $OUPath,
 
-    if ($result -ne $null) {
-      break
-    }
-  }
-
-  $cred = New-Object System.Management.Automation.PSCredential @(
-    $User,
-    (ConvertTo-SecureString -String $Password -AsPlainText -Force)
+    [timespan]
+    $Timeout = [timespan]::FromMinutes(4)
   )
+  try {
+    $start = [datetime]::Now
 
-  # As of S2016TP5, a successful ping to the domain name does not in itself
-  # signify readiness of a new domain controller (for a new forest) to take
-  # domain join requests. Hence, I am forced to wrap Add-Computer itself in
-  # a try-catch wrapper.
-  while ($true) {
-    try {
-      $result = Add-Computer -DomainName  $Domain `
-                             -Credential  $cred `
-                             -ErrorAction Stop `
-                             -PassThru
-    }
-    catch {
-      $global:Error.RemoveAt(0)
+    $ping = New-Object System.Net.NetworkInformation.Ping
 
-      Start-Sleep -Seconds 5
+    while ($true) {
+      if (([datetime]::Now - $start) -gt $Timeout.Duration()) {
+        throw "Domain join failed: the domain name was not ping-accessible within the configured timeout."
+      }
+
+      try {
+        $pingResult = $ping.Send($DomainName)
+      } catch {
+        if (
+          $_.Exception -is [System.Management.Automation.MethodInvocationException] -and
+          $_.Exception.InnerException -is [System.Net.NetworkInformation.PingException] -and
+          $_.Exception.InnerException.InnerException -is [System.Net.Sockets.SocketException] -and
+          $_.Exception.InnerException.InnerException.Message -eq "No such host is known"
+        ) {
+          $Global:Error.RemoveAt(0)
+
+          & ipconfig /flushdns |
+            Out-Null
+        } else {
+          throw "Domain join failed: ping attempt failed with unexpected exception: $($_.Exception.Message)"
+        }
+      }
+
+      if (
+        $null -ne $pingResult -and
+        $pingResult.Status -eq [System.Net.NetworkInformation.IPStatus]::Success
+      ) {
+        break
+      }
     }
 
-    if ($result.HasSucceeded -eq $true) {
-      break
+    $joinCredential = New-Object System.Management.Automation.PSCredential @(
+      $UserName,
+      (ConvertTo-SecureString -String $Password -AsPlainText -Force)
+    )
+
+    $addParams = @{
+      DomainName  = $DomainName
+      Credential  = $joinCredential
+      ErrorAction = "Stop"
+      PassThru    = $true
     }
+
+    if ($PSBoundParameters.ContainsKey("OUPath")) {
+      $addParams.OUPath = $OUPath
+    }
+
+    while ($true) {
+      if (([datetime]::Now - $start) -gt $Timeout.Duration()) {
+        throw "Domain join failed: the add operation did not succeed within the configured timeout."
+      }
+
+      try {
+        $addResult = Add-Computer @addParams
+      } catch {
+        if ($_.Exception.Message -eq "%PLACEHOLDER%") { # Placeholder; expected avenues of join failure would be enumerated here.
+          $Global:Error.RemoveAt(0)          
+        } else {
+          throw "Domain join failed: join attempt failed with unexpected exception: $($_.Exception.Message)"
+        }
+      }
+
+      if ($null -ne $addResult -and $addResult.HasSucceeded -eq $true) {
+        break
+      }
+    }
+  } catch {
+    $PSCmdlet.ThrowTerminatingError($_)
   }
 }
 
@@ -317,11 +396,17 @@ function Set-AutoLogon {
   )]
   param(
     [string]
-    $DomainName,
+    $DomainName = "",
     
+    [Parameter(
+      Mandatory = $true
+    )]
     [string]
     $UserName,
-    
+
+    [Parameter(
+      Mandatory = $true
+    )]    
     [string]
     $Password,
 
@@ -332,10 +417,18 @@ function Set-AutoLogon {
     $Count = 1,
 
     [Parameter(
-      ParameterSetName = "Persist"
+      ParameterSetName = "Persist",
+      Mandatory = $true
     )]
     [switch]
-    $Persist
+    $Persist,
+
+    [Parameter(
+      ParameterSetName = "Force",
+      Mandatory = $true
+    )]
+    [switch]
+    $Force
   )
   $path = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
 
@@ -346,24 +439,18 @@ function Set-AutoLogon {
 
   if ($PSCmdlet.ParameterSetName -eq "Count") {
     Set-ItemProperty -LiteralPath $path -Name AutoLogonCount -Value $Count -Type DWord -Force
-  }
-  elseif ($PSCmdlet.ParameterSetName -eq "Persist" -and (Get-Item -LiteralPath $path).Property -contains "AutoLogonCount") {
+  } elseif ((Get-Item -LiteralPath $path).Property -contains "AutoLogonCount") {
     Remove-ItemProperty -LiteralPath $path -Name AutoLogonCount -Force
+  }
+
+  if ($PSCmdlet.ParameterSetName -eq "Force") {
+    Set-ItemProperty -LiteralPath $path -Name ForceAutoLogon -Value 1 -Type DWord -Force
   }
 }
 
 # PROVISO: If an active user account with a blank password has been set to
 # autologon, clearing it in this manner will not actually stop the account
-# from logging on at every reboot. The commonly suggested method for doing
-# this online is to toggle the value "Enabled" at the following registry
-# path:
-#
-# HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\LogonUI\UserSwitch
-#
-# However, this setting reverts with every restart unless additional measures
-# are taken, and since the impacts of this change are unclear (some comments
-# claim that it impacts Windows UAC), and the benefits so minor, I've decided
-# not to implement it in any form.
+# from logging on at every reboot. There is no available remediation.
 function Clear-AutoLogon {
   $path = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
 
@@ -372,10 +459,9 @@ function Clear-AutoLogon {
   $propertiesAtPath = Get-Item -LiteralPath $path |
                         ForEach-Object Property
 
-  "DefaultDomainName",
   "DefaultPassword",
   "AutoLogonCount",
-  "AutoLogonSID" |
+  "ForceAutoLogon" |
     ForEach-Object {
       if ($propertiesAtPath -contains $_) {
         Remove-ItemProperty -LiteralPath $path -Name $_ -Force
@@ -383,74 +469,131 @@ function Clear-AutoLogon {
     }
 }
 
-function Set-VolumeDriveLetter ([string]$FileSystemLabel, [string]$DriveLetter) {
-  $volume = @(
-    Get-Volume |
-      Where-Object FileSystemLabel -eq $FileSystemLabel
+function Set-VolumeDriveLetter {
+  [CmdletBinding(
+    PositionalBinding = $false
+  )]
+  param(
+    [Parameter(
+      Mandatory = $true
+    )]
+    [string]
+    $FileSystemLabel,
+
+    [char]
+    $DriveLetter,
+
+    [timespan]
+    $Timeout = [timespan]::FromMinutes(1),
+
+    [switch]
+    $OnlineAllDisks,
+
+    [switch]
+    $PassThru
   )
 
-  if ($volume.Count -eq 0) {
-    $offlineDisks = @(
-      Get-Disk |
-        Where-Object OperationalStatus -eq Offline |
-        Where-Object PartitionStyle -ne RAW
+  try {
+    $startTime = [datetime]::Now
+
+    if ($PSBoundParameters.ContainsKey("DriveLetter") -and $DriveLetter -cnotmatch "^[A-Z]$") {
+      throw "When provided, DriveLetter must be a capital letter."
+    }
+
+    $volume = @(
+      Get-Volume |
+        Where-Object FileSystemLabel -ceq $FileSystemLabel
     )
 
-    if ($offlineDisks.Count -eq 0) {
-      Write-Error "Could not assign drive letter. Volume with FileSystemLabel `"$FileSystemLabel`" was not found, and no offline disks on which it might reside were available."
-      return
+    Write-Verbose "Initial volume-with-label count: $($volume.Count)."
+
+    if ($volume.Count -eq 0) {
+
+      Write-Verbose "Volume not found w/ initial search; onlining offline disk(s)."
+
+      $offlineDisks = @(
+        Get-Disk |
+          Where-Object OperationalStatus -eq Offline |
+          Where-Object PartitionStyle -ne RAW
+      )
+
+      Write-Verbose "Offline disks count: $($offlineDisks.Count)."
+
+      if ($offlineDisks.Count -gt 1 -and $OnlineAllDisks -eq $false) {
+        throw "More than one attached partitioned disk is offline. Use the OnlineAllDisks switch to bring all disks online."
+      }
+
+      $offlineDisks |
+        Set-Disk -IsOffline:$false
+
+      $offlineDisks |
+        Set-Disk -IsReadOnly:$false
+
+      $volume = @(
+        Get-Volume |
+          Where-Object FileSystemLabel -ceq $FileSystemLabel
+      )
+
+      Write-Verbose "Subsequent volume-with-label count: $($volume.Count)."
     }
 
-    if ($offlineDisks.Count -ne 1) {
-      Write-Error "Could not assign drive letter. Volume with FileSystemLabel `"$FileSystemLabel`" was not found, and there were multiple partitioned offline disks on which it might reside."
-      return
+    if ($volume.Count -ne 1) {
+      throw "Exactly one volume with FileSystemLabel provided must be found on attached storage. $($volume.Count) were found."
     }
 
-    $offlineDisks |
-      Set-Disk -IsOffline $false
+    $partition = $volume |
+                   Get-Partition
 
-    $offlineDisks |
-      Set-Disk -IsReadOnly $false
+    if ([byte]$partition.DriveLetter -eq 0 -or ($PSBoundParameters.ContainsKey("DriveLetter") -and $partition.DriveLetter -cne $DriveLetter)) {
+      Write-Verbose "Volume partition drive letter is unassigned or not as desired."
 
-    $loopNumber = 1
+      Write-Verbose "  - Changing."
 
-    while ($loopNumber -le 2) {
-      try {
-        $volume = @(
-          Get-Volume |
-            Where-Object FileSystemLabel -eq $FileSystemLabel
-        )
+      if ($PSBoundParameters.ContainsKey("DriveLetter")) {
+        $partition |
+          Set-Partition -NewDriveLetter $DriveLetter
+      } else {
+        $partition |
+          Add-PartitionAccessPath -AssignDriveLetter
+      }
 
-        if ($volume.Count -eq 0) {
-          throw
+      Write-Verbose "  - Confirming change has taken effect @ $([datetime]::Now - $startTime)."
+
+      do {
+        if (([datetime]::Now - $startTime) -gt $Timeout) {
+          throw "Volume partition drive letter change was not confirmed within configured timeout."
         }
-      }
-      catch {
-        Start-Sleep -Seconds 5
-        $loopNumber++
-        continue
-      }
 
-      break
+        $partition = $partition |
+                       Get-Partition
+      } until (
+        [byte]$partition.DriveLetter -ne 0 -and
+        ($PSBoundParameters.ContainsKey("DriveLetter") -eq $false -or $partition.DriveLetter -eq $DriveLetter)
+      )
+
+      Write-Verbose "  - Change confirmed @ $([datetime]::Now - $startTime)."
     }
-  }
 
-  if ($volume.Count -eq 0) {
-    Write-Error "Could not assign drive letter. Volume with FileSystemLabel `"$FileSystemLabel`" was not found."
-    return
-  }
+    $volume = Get-Volume -UniqueId $volume[0].UniqueId
 
-  if ($volume.Count -gt 1) {
-    Write-Error "Could not assign drive letter. Multiple volumes with FileSystemLabel `"$FileSystemLabel`" were found."
-    return
-  }
+    $volume | Add-Member -MemberType NoteProperty -Name Root -Value "$($volume.DriveLetter):\"
 
-  $partition = $volume |
-                 Get-Partition
+    Write-Verbose "Confirming PSDrive availability of Volume.Root @ $([datetime]::Now - $startTime)."
 
-  if ($partition.DriveLetter -ne $DriveLetter) {
-    $partition |
-      Set-Partition -NewDriveLetter $DriveLetter
+    do {
+      if (([datetime]::Now - $startTime) -gt $Timeout) {
+        throw "PSDrive availability was not confirmed within configured timeout."
+      }
+    } until ($null -ne (Get-PSDrive | Where-Object Root -eq $volume.Root))
+
+    Write-Verbose "PSDrive availability of Volume.Root confirmed @ $([datetime]::Now - $startTime)."
+
+    if ($PassThru) {
+      Write-Verbose "Emitting Volume object. Root is available at Volume.Root to facilitate pathing."
+      $volume
+    }
+  } catch {
+    $PSCmdlet.ThrowTerminatingError($_)
   }
 }
 
@@ -493,6 +636,37 @@ function Test-CTBackInfo ([switch]$Quiet) {
     return [PSCustomObject]$outHash
   }
 }
+
+function New-CTBackInfoUserListObjectsItem {
+  [CmdletBinding(
+    PositionalBinding = $false
+  )]
+  param(
+    [string]
+    $DomainName = "",
+    
+    [Parameter(
+      Mandatory = $true
+    )]
+    [string]
+    $UserName,
+
+    [Parameter(
+      Mandatory = $true
+    )]    
+    [string]
+    $Password
+  )
+
+  [PSCustomObject]@{
+    PSTypeName = "CTBackInfoUserListObjectsItem"
+    DomainName = $DomainName
+    UserName   = $UserName
+    Password   = $Password
+  }
+}
+
+Set-Alias -Name ulItem -Value New-CTBackInfoUserListObjectsItem
 #endregion
 
 #region Saved Data
@@ -632,6 +806,105 @@ function Write-TokenSubstitutions {
   }
 }
 
+function Invoke-ConfigTaskAsUser {
+  [CmdletBinding(
+    PositionalBinding = $false
+  )]
+  param(
+    [Parameter(
+      ValueFromPipeline = $true,
+      Mandatory = $true      
+    )]
+    [ciminstance]
+    $InputObject,
+
+    [Parameter(
+      Mandatory = $true      
+    )]
+    [string]
+    $UserName,
+
+    [Parameter(
+      Mandatory = $true      
+    )]
+    [string]
+    $Password,
+
+    [timespan]
+    $Timeout = [timespan]::FromMinutes(1)
+  )
+  begin {
+    try {
+      $start = [datetime]::Now
+
+      while ($true) {
+        if (([datetime]::Now - $start) -gt $Timeout.Duration()) {
+          throw "Invoke failed: Translation from UserName to SID was not confirmed within the configured timeout."
+        }
+      
+        try {
+          $NTAccount = New-Object -TypeName System.Security.Principal.NTAccount -ArgumentList $UserName
+
+          $SID = $NTAccount.Translate([System.Security.Principal.SecurityIdentifier])
+        } catch {
+          if ($_.Exception.Message -eq "Placeholder for known exception(s).") {
+            $Global:Error.RemoveAt(0)
+          } else {
+            throw "Invoke failed: translation from UserName to SID failed with unexpected exception: $($_.Exception.Message)"
+          }
+        }
+
+        if ($null -ne $SID -and $SID -is [System.Security.Principal.SecurityIdentifier]) {
+          break
+        }
+      }
+    } catch {
+      $PSCmdlet.ThrowTerminatingError($_)
+    }
+  }
+  process {
+    try {
+      if ($InputObject.CimClass.ToString() -ne "Root/Microsoft/Windows/TaskScheduler:MSFT_ScheduledTask") {
+        throw "InputObject must be a ciminstance of class MSFT_ScheduledTask."
+      }
+
+      while ($true) {
+        if (([datetime]::Now - $start) -gt $Timeout.Duration()) {
+          throw "Invoke failed: Scheduled task changes were not successful within the configured timeout."
+        }
+      
+        try {
+          Set-ScheduledTask `
+          -TaskName $InputObject.TaskName `
+          -User $UserName `
+          -Password $Password `
+          -Trigger (New-ScheduledTaskTrigger -At (Get-Date).AddMinutes(1) -Once) `
+          -ErrorAction Stop
+
+          $hadError = $false
+        } catch {
+          $hadError = $true
+
+          if (
+            $_.Exception -is [Microsoft.Management.Infrastructure.CimException] -and
+            $_.Exception.Message -eq "The user name or password is incorrect.`r`n"
+          ) {
+            $Global:Error.RemoveAt(0)
+          } else {
+            throw "Invoke failed: 'Set-ScheduledTask' failed with unexpected exception: $($_.Exception.Message)"
+          }
+        }
+
+        if (-not $hadError) {
+          break
+        }
+      }
+    } catch {
+      $PSCmdlet.ThrowTerminatingError($_)
+    }
+  }
+}
+
 function Register-ConfigTask ([string]$Name, [scriptblock]$Task, [switch]$AtStartup, [switch]$NoAutoUnregister) {
   $stringTask = $Task.ToString().Trim()
 
@@ -754,6 +1027,64 @@ function Register-LogonTask ([string]$For, [string]$Name,  [scriptblock]$Task, [
 }
 
 #region Cleanup & Host Communication
+function Remove-ItemRobust {
+  [CmdletBinding()]
+  param(
+    [Parameter(
+      Mandatory = $true,
+      ValueFromPipelineByPropertyName = $true
+    )]
+    [Alias("PSPath")]
+    [string]
+    $LiteralPath,
+
+    [switch]
+    $Recurse,
+
+    [timespan]
+    $Timeout = [timespan]::FromMinutes(1)
+  )
+  begin {
+    $start = [datetime]::Now
+
+    $riParams = @{
+      LiteralPath = $null
+      Recurse     = $Recurse
+      Force       = $true
+      ErrorAction = "Stop"
+    }
+  }
+  process {
+    try {
+      $riParams.LiteralPath = $LiteralPath
+
+      do {
+        if (([datetime]::Now - $start) -gt $Timeout) {
+          throw "Removal of item was not confirmed within configured timeout."
+        }
+
+        try {
+          $pathMayExist = Test-Path -LiteralPath $riParams.LiteralPath -ErrorAction Stop
+
+          if ($pathMayExist) {
+            Remove-Item @riParams
+
+            Write-Verbose "The 'Remove-Item' command for path '$($riParams.LiteralPath)' finished without error @ $([datetime]::Now - $start)."
+          } else {
+            Write-Verbose "Absence of item @ path '$($riParams.LiteralPath)' confirmed @ $([datetime]::Now - $start)."
+          }
+        } catch {
+          $Global:Error.RemoveAt(0)
+
+          $pathMayExist = $true
+        }
+      } until (-not $pathMayExist)
+    } catch {
+      $PSCmdlet.ThrowTerminatingError($_)
+    }
+  }
+}
+
 function Remove-SetupPaths ([string[]]$And = @()) {
   $paths = @(
     "unattend.xml"                 # Unattend file placed by LoadBuilder for OS specialization.
@@ -893,5 +1224,7 @@ function Wait-HostPoke ([Switch]$RemoveHostValues) {
 }
 #endregion
 
-Export-ModuleMember -Function * -Variable sessions,
-                                          scriptParameters
+Export-ModuleMember -Function * `
+                    -Alias ulItem `
+                    -Variable sessions,
+                              scriptParameters
